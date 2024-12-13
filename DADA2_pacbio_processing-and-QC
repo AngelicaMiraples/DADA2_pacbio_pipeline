@@ -1,0 +1,263 @@
+# DADA2 pipeline for pacbio sequencing data to generate a phyloseq object a the final product for downstream manipulation and data analysis 
+# based on the pipeline by Benjamin J Callahan: https://benjjneb.github.io/LRASManuscript/LRASms_fecal.html
+
+# original script is derived from an R markdown file, can find it here: !!PASTE HTML HERE!!
+
+# set wd 
+
+# LOAD PACKAGES
+library(dada2)
+library(Biostrings)
+library(gridExtra)
+library(ggplot2)
+library(reshape2)
+
+
+
+# run all samples that have the fastq.gz pattern in file name 
+# if running into problems can select certain similar samples at a time
+
+fns <- list.files("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/", pattern="fastq.gz|ccs", full.names=TRUE)
+F27 <- "AGRGTTYGATYMTGGCTCAG" # Genome Quebec F27-version-b primer seq, replace with the primers you used
+R1492 <- "RGYTACCTTGTTACGACTT" # Genome Quebec R1492-version-b primer seq, replace with the primers you used
+rc <- dada2:::rc
+theme_set(theme_bw())
+
+
+# Remove Primers and Filter
+# Reverse compliment so they read in the same 5'-3' direction 
+
+nops <- file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/", "noprimers", basename(fns))
+prim <- removePrimers(fns, nops, primer.fwd=F27, primer.rev=dada2:::rc(R1492), orient=TRUE, verbose=TRUE)
+
+
+
+# Inspect length distribution
+lens.fn <- lapply(nops, function(fn) nchar(getSequences(fn)))
+lens <- do.call(c, lens.fn)
+hist(lens, 100)
+
+hist(lens, 100, xlim = c(1200, 1800)) # confirm a strong peak between 1400 and 1500 for 16S 
+
+
+
+# filter
+filts <- file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/", "noprimers", "filtered", basename(fns))
+track <- filterAndTrim(nops, filts, minQ=3, minLen=1300, maxLen=1600, maxN=0, rm.phix=FALSE, maxEE=2, verbose=TRUE)
+track
+
+
+
+## NEXT STEPS ARE FOR DADA2: 
+# Run DADA2: dereplicate and combine all identical sequencing reads into “unique sequences” with a corresponding “abundance” equal to the number of reads with that unique sequence. 
+# Dereplication substantially reduces computation time by eliminating redundant comparisons; drp <- derepFastq(filts, verbose=TRUE)
+ 
+
+#learn errors
+#The DADA2 algorithm makes use of a parametric error model (err) and every amplicon dataset has a different set of error rates. 
+# The learnErrors method learns this error model from the data, by alternating estimation of the error rates and inference of sample composition until they converge on a jointly consistent solution
+err <- learnErrors(filts, errorEstimationFunction=PacBioErrfun, BAND_SIZE=32, multithread=TRUE)
+
+# save err and filtered seqs as filts
+saveRDS(err, file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/", " pio1300_1600_pseudo_err.rds"))
+saveRDS(filts, file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/noprimers/filtered", "pio1300-1600_pseudo_filts.rds"))
+
+# if filtering removes all reads from certain samples, filter all filts to make sure they actually exist
+filts <- filts[file.exists(filts)]
+
+
+# read-in RDS files 
+err = readRDS("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/pio1300-1600_pseudo_err.rds")
+err
+
+# confirm location of filts - after filtration, samples may have 0 reads
+filts = readRDS("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/noprimers/filtered/pio1300-1600_pseudo_filts.rds")
+filts
+
+
+# plot the errors: check if the model (black line) reasonably fits the observations (black points)?
+# chcek if the  error rates mostly decrease with quality score?
+plotErrors(err)
+
+
+# denoise
+# The Divisive Amplicon Denoising Algorithm (DADA) introduced a model-based approach for correcting amplicon errors without constructing OTUs
+# Set: DETECT_SINGLETONS=TRUE if we want to include rare taxa, OMEGA_A=1e-10
+dd <- dada(filts, err=err, pool="pseudo", BAND_SIZE=32, OMEGA_A=1e-10, DETECT_SINGLETONS=FALSE, multithread=TRUE)
+
+
+saveRDS(dd, file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout", "dd_pio1300-1600_pseudo.rds"))
+
+
+
+
+# track the number of reads through the pipeline so far 
+cbind(ccs=prim[,1], primers=prim[,2], filtered=track[,2], denoised=sapply(dd, function(x) sum(x$denoised)))
+
+
+
+#sequence table
+st <- makeSequenceTable(dd); dim(st)
+
+
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(st)))
+
+summary(nchar(getSequences(st)))
+
+
+
+# A new default value of minFoldParentOverabundance= 3.5 is recommended for chimera identification in full-length 16S rRNA gene sequencing data
+# This is done to avoid spurious identification of some 16S variants as chimeras of other 16S variants that occur at higher copy number within the same genome.
+
+bim <- isBimeraDenovo(st, minFoldParentOverAbundance = 3.5, multithread=FALSE) # multithread = TRUE; error mc.cores > 1 not supported on windows 
+table(bim)
+
+
+# check chimeras
+sum(st[,bim])/sum(st)
+
+st.nochim <- removeBimeraDenovo(st, method = "consensus", multithread=TRUE, verbose = TRUE)
+
+
+
+# track reads once more
+cbind(ccs=prim[,1], primers=prim[,2], filtered=track[,2], denoised=sapply(dd, function(x) sum(x$denoised)), noChimera=rowSums(st.nochim))
+
+
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(st.nochim)))
+
+summary(nchar(getSequences(st.nochim)))
+
+
+
+# SAVE sequence table with and without chimeras
+saveRDS(st, file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout", "st_pio1300-1600_pseudo.rds"))
+saveRDS(st.nochim, file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout", "st.nochim_pio1300-1600_pseudo.rds"))
+
+st.nochim.export <- st.nochim
+write.csv(st.nochim.export,"C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/st.nochim_pio1300-1600_pseudo.csv")
+
+
+# assign taxonomy using training set silva!
+tax <- assignTaxonomy(st.nochim,"C:/Users/Angelica/OneDrive - University of Guelph/Desktop/Bioinformatics/R/silva_nr99_v138.1_wSpecies_train_set.fa.gz", tryRC = TRUE, minBoot = 80, multithread=TRUE)
+colnames(tax) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+
+# SAVE taxonomic table output
+saveRDS(tax, file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout", "tax_Silva138_w.Species_pio1300-1600_pseudo.rds"))
+tax1.export <- tax
+write.csv(tax1.export,"C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/tax_pio1300-1600_pseudo.csv")
+
+
+
+sq <- getSequences(st.nochim)
+#SAVE all non chimeric sequences 
+saveRDS(sq, file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout", "sq_pio1300-1600_pseudo.rds"))
+
+
+library(WriteXLS)
+
+st.nochim.export <- st.nochim
+colnames(st.nochim.export) <- paste0("ASV", seq(ncol(st.nochim)))
+write.csv(st.nochim.export,"C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/st.nochim1_pio1300-1600.csv")
+
+
+# rename each taxa with prefix ASV_
+tax.export <- tax
+colnames(tax.export) <- paste0("rank", seq(ncol(tax)))
+rownames(tax.export) <- paste0("ASV", seq(nrow(tax)))
+write.csv(tax.export,"C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/tax.nochim1_pio1300-1600.csv")
+
+
+sq.export <- sq
+write.csv(sq.export,"C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/sq_pio1300-1600_pseudo.csv")
+
+tax.export <- tax
+write.csv(tax.export,"C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/tax.nochim_pio1300-1600_pseudo.csv")
+
+st.nochim.export <- st.nochim
+write.csv(st.nochim.export,"C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/st.nochim_pio1300-1600_pseudo.csv")
+
+
+
+# STEPS for phylogenetic tree generation
+library(DECIPHER)
+
+names(sq) <- sq # This propagates to the tip labels of the tree
+alignment <- AlignSeqs(DNAStringSet(sq), anchor=NA,verbose=FALSE)
+
+
+#SAVE sequence alignment 
+saveRDS(alignment, file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout", "alignment_pio1300-1600_pseudo.rds"))
+
+library(phangorn)
+
+phangAlign <- phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phangAlign)
+treeNJ <- NJ(dm) # Note, tip order != sequence order
+fit = pml(treeNJ, data=phangAlign)
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE,
+        rearrangement = "stochastic", control = pml.control(trace = 0))
+detach("package:phangorn", unload=TRUE)
+
+
+#SAVE fitGTR output
+saveRDS(fitGTR, file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout", "fitGTR_pio1300-1600_pseudo.rds"))
+
+
+samples.out <- rownames(st.nochim)
+samples.out
+
+# rename samples by removing the parts of their name that is the same i.e. file extensions
+names <- sapply(strsplit(samples.out, ".hifi_reads.|.ccs."), `[`, 1)
+names
+
+# replace sample names in the sequence table
+row.names(st.nochim) <- names
+
+# Sample Metadata
+# Import the metadata for these samples
+# Sweep function: Return an array obtained from an input array by sweeping out a summary statistic
+df <- read.csv("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/metadata_pio.csv", header=TRUE, sep="\t", stringsAsFactors=FALSE)
+nameLine <- readLines(con="metadata_pio.csv", n=1) ### check if need to change to metadata_compile.csv
+fileColNames <- unlist(strsplit(nameLine, ";"))
+row.names(df) <- names
+head(df)
+df
+
+
+
+samdf <- read.csv("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout/metadata_pio.csv", header=TRUE)
+all(rownames(st.nochim) %in% samdf$SampleID) # TRUE
+
+
+
+
+rownames(samdf) <- samdf$SampleID
+keep.cols <- c("SampleID", "PlantTissue","Mechanism", "Year", "Trial", "Replicate")
+samdf <- samdf[rownames(st.nochim), keep.cols]
+
+# STEPS to combine the taxonomy table, the metadata, the OTU table and phylogenetic tree to make a phyloseq object
+
+library(phyloseq)
+ps <- phyloseq(tax_table(tax),
+                 sample_data(samdf),
+                 otu_table(st.nochim, taxa_are_rows = FALSE), # EK uses false, changed to true for downstream processing troubleshooting
+                 phy_tree(fitGTR$tree))
+ps
+
+# brief review of the object
+sample_names(ps)
+
+#SAVE phyloseq output
+saveRDS(ps, file.path("C:/Users/Angelica/OneDrive - University of Guelph/Documents/R_doc/data_poll-inout", "ps_pio1316_with-phylo_with-organelles.rds"))
+
+
+## NEXT 
+# since these sample were obtained from plant material, will need to remove any chloroplast or mitochondrial DNA
+
